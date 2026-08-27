@@ -1,0 +1,84 @@
+name: DotB Sync
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dotb-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Daten von DotB holen
+        env:
+          TOKEN: ${{ secrets.DOTB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="https://dotb.io/api/public/v1"
+          WORK=/tmp/dotb          # ausserhalb des Repos: Klartext wird NIE committet
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          FROM=$(date -u -d '90 days ago' +%Y-%m-%d)
+
+          fetch() {
+            curl -sS -o "$2" -w "%{http_code}" --max-time 60 \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" "$BASE$1"
+          }
+
+          paginate() {   # $1=pfad $2=praefix $3=maxseiten
+            local cursor="" page=1 out code more
+            while [ "$page" -le "$3" ]; do
+              local url="$1"
+              [ -n "$cursor" ] && url="$url&cursor=$cursor"
+              out="$WORK/$2_page_$(printf '%03d' $page).json"
+              code=$(fetch "$url" "$out")
+              if [ "$code" = "429" ]; then echo "Rate Limit, warte 65s"; sleep 65; continue; fi
+              if [ "$code" != "200" ]; then echo "::error::$2 Seite $page -> HTTP $code"; exit 1; fi
+              more=$(grep -o '"has_more":[a-z]*' "$out" | head -1 | cut -d: -f2 || echo false)
+              cursor=$(grep -o '"next_cursor":"[^"]*"' "$out" | head -1 | cut -d'"' -f4 || echo "")
+              [ "$more" = "true" ] && [ -n "$cursor" ] || break
+              page=$((page+1)); sleep 1
+            done
+            echo "$2: $page Seite(n)"
+          }
+
+          code=$(fetch "/accounts" "$WORK/accounts.json")
+          [ "$code" = "200" ] || { echo "::error::accounts -> HTTP $code"; exit 1; }
+          paginate "/orders?limit=100&include=items,account,buyer&sort=-created_at&from=$FROM" orders 100
+          paginate "/items?limit=100&status=all" items 100
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > "$WORK/fetched_at.txt"
+          du -sh "$WORK"
+
+      - name: Verschlüsseln und veröffentlichen
+        env:
+          ENC_PASS: ${{ secrets.ENC_PASS }}
+        run: |
+          set -euo pipefail
+          tar -czf /tmp/data.tar.gz -C /tmp/dotb .
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in /tmp/data.tar.gz -out /tmp/data.tar.gz.enc -pass env:ENC_PASS
+          ls -lh /tmp/data.tar.gz.enc
+
+          rm -rf /tmp/pub && mkdir -p /tmp/pub
+          cp /tmp/data.tar.gz.enc /tmp/pub/
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > /tmp/pub/last_sync.txt
+          echo "Verschluesselte DotB-Daten. Nur mit Passwort lesbar." > /tmp/pub/README.md
+
+          cd /tmp/pub
+          git init -q -b data
+          git config user.name  "dotb-sync"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "Sync $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push -q --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            HEAD:data
+          echo "Veröffentlicht auf Branch 'data'."
